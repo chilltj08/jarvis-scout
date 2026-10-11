@@ -1,0 +1,9 @@
+source,sku,title,brand,model,ean,variation,pack_quantity,unit_cost,delivery_cost,supplier_url,currency,supplier_vat_included,available_quantity,observed_at
+Demo UK Supplier (fictional),NLS750,Northline Storage 750ml container teal,Northline Storage,NLS-750,9990000000012,Teal,1,9.99,0.75,https://example.com/demo/container,GBP,true,40,
+Demo UK Supplier (fictional),HLMUG,Hearthlane 350ml ceramic mug white,Hearthlane,HL-MUG350,9990000000029,White,1,10.00,0.75,https://example.com/demo/mug,GBP,true,20,
+Demo UK Supplier (fictional),BDNOTE,BrightDesk A5 notebook single blue,BrightDesk,BD-NOTE-A5,9990000000036,Blue,1,2.50,0.50,https://example.com/demo/notebook,GBP,true,100,
+Demo UK Supplier (fictional),TNBTL,TrailNest 500ml bottle blue,TrailNest,TN-BTL500,9990000000043,Blue,1,8.00,0.75,https://example.com/demo/bottle,GBP,true,30,
+Demo UK Supplier (fictional),PHFILT,Purehouse replacement filters pack of two,Purehouse,PH-FILT2,9990000000050,White,2,9.00,1.00,https://example.com/demo/filters,GBP,true,50,
+Demo UK Supplier (fictional),AWUSB,ArcWorks USB C cable 1m black,ArcWorks,AW-USB-C1,,Black,1,3.00,0.50,https://example.com/demo/cable,GBP,true,25,
+Demo UK Supplier (fictional),MTPRUNE,MeadowTools pruning shears green,MeadowTools,MT-PRUNE2,9990000000074,Green,1,8.50,0.75,https://example.com/demo/shears,GBP,true,20,
+Demo UK Supplier (fictional),UNMATCHED,Example spare part with no catalog match,OddParts,OP-UNLISTED,,Silver,1,2.00,0.50,https://example.com/demo/spare,GBP,true,5,
