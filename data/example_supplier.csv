@@ -1,0 +1,5 @@
+ean,name,brand,pack_quantity,supplier,buy_price,inbound_cost
+9000000000001,Demo A5 Notebook,DemoPaper,1,Sample Stationery Supplier,4.50,0.50
+9000000000002,Demo Cable Organiser,DemoDesk,1,Example Clearance Outlet,7.00,0.80
+9000000000003,Demo Storage Crate,DemoHome,1,Sample Wholesaler,14.00,1.50
+9000000000004,Demo Notebook 3-Pack,DemoPaper,3,Sample Stationery Supplier,8.50,1.00

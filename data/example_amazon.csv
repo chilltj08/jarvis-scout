@@ -1,0 +1,5 @@
+ean,name,brand,pack_quantity,selling_price,referral_rate,fulfilment_cost
+9000000000001,Demo A5 Notebook,DemoPaper,1,13.99,0.15,2.75
+9000000000002,Demo Cable Organiser,DemoDesk,1,21.99,0.15,3.40
+9000000000003,Demo Storage Crate,DemoHome,1,30.00,0.15,4.60
+9000000000004,Demo Notebook 3-Pack,DemoPaper,1,29.99,0.15,3.20
