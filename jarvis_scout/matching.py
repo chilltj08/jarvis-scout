@@ -42,10 +42,17 @@ def normalize_gtin(value: str | None) -> str | None:
 
 def _identity_reasons(product: SupplierProduct, listing: AmazonListing) -> list[str]:
     reasons: list[str] = []
+    real_evidence = listing.simulated is False and listing.provenance in {"manual", "official"}
+    if listing.simulated is False and not (real_evidence and listing.identifier_verified is True):
+        reasons.append("Amazon identifier evidence is unverified; verify the shared GTIN manually.")
     for attribute in ("brand", "model", "variation"):
         supplier_value = _normalize_attribute(getattr(product, attribute))
         amazon_value = _normalize_attribute(getattr(listing, attribute))
         label = attribute.capitalize()
+        # Verified barcode evidence can identify items that have no model or
+        # variation at either source. One-sided omissions still need review.
+        if real_evidence and attribute != "brand" and not supplier_value and not amazon_value:
+            continue
         if not supplier_value or not amazon_value:
             reasons.append(f"{label} is missing on one or both products; verify manually.")
         elif supplier_value != amazon_value:
@@ -76,10 +83,11 @@ def _fallback_identity(product: SupplierProduct, listing: AmazonListing) -> bool
 
 
 def match_product(product: SupplierProduct, candidates: list[AmazonListing]) -> MatchResult:
-    """Return an exact match only when GTIN and all sellable attributes agree.
+    """Return an exact match only when GTIN and compatible attributes agree.
 
-    Missing/invalid identifiers and any conflicting or missing identity fields
-    need human review. Supplier SKU is source-local and never matches an ASIN.
+    Real Amazon evidence must explicitly verify the shared identifier. Both
+    model/variation fields may be blank for such evidence; brand and pack must
+    still agree. Supplier SKU is source-local and never matches an ASIN.
     Multiple candidate ASINs sharing the matching GTIN also need human review.
     """
     product_gtin = normalize_gtin(product.ean)
@@ -133,7 +141,9 @@ def match_product(product: SupplierProduct, candidates: list[AmazonListing]) -> 
             listing,
             "exact",
             1.0,
-            ["Valid GTIN, brand, model, variation and pack quantity all match."],
+            ["Verified GTIN, brand and compatible model, variation and pack quantity match."
+             if listing.simulated is False else
+             "Simulated valid GTIN, brand, model, variation and pack quantity all match."],
         )
     if len(fallbacks) > 1:
         asins = ", ".join(listing.asin for listing, _ in fallbacks)

@@ -5,7 +5,9 @@ can be costed: splitting or combining packs needs a separate verified workflow.
 Amazon selling prices include sales VAT; Amazon referral and FBA fees are
 VAT-exclusive. The referral percentage is applied to the full selling price.
 
-For a non-registrant, purchase, delivery and packaging include their input VAT.
+For a non-registrant, purchase, delivery, packaging, inbound shipping and other
+costs include their input VAT. Supplier treatment controls purchase and delivery
+VAT; ``not_applicable`` means no VAT is charged on those supplier inputs.
 For a VAT registrant, sales VAT is removed from revenue. Input VAT is recovered
 only when ``reclaim_input_vat`` is enabled; that assumption requires valid VAT
 invoices and eligibility for each input. The model assumes standard VAT
@@ -38,12 +40,17 @@ HUNDRED = Decimal("100")
 
 @dataclass(frozen=True)
 class ProfitAssumptions:
-    """Rates are fractions (0.20 means 20%); packaging is VAT-inclusive.
+    """Rates are fractions (0.20 means 20%); extra costs are VAT-inclusive.
 
     ``supplier_vat_included`` on the supplier record applies to both the pack
     price and its per-pack allocated delivery charge. Zero rates support
     non-VAT-charging suppliers and zero-rated inputs. Input recovery is an
     explicit eligibility assumption, not an automatic result of registration.
+    ``inbound_shipping_cost`` covers transport to fulfilment or outbound postage
+    not already included in the listing's fulfilment estimate. ``other_costs``
+    covers per-pack storage, preparation or other expenses. Each has an explicit
+    VAT rate; split mixed-VAT costs before entering them or use a defensible
+    effective rate. Do not enter the same cost in more than one category.
     """
 
     packaging_cost: Decimal = Decimal("0.50")
@@ -55,14 +62,20 @@ class ProfitAssumptions:
     delivery_vat_rate: Decimal = Decimal("0.20")
     packaging_vat_rate: Decimal = Decimal("0.20")
     reclaim_input_vat: bool = True
+    inbound_shipping_cost: Decimal = ZERO
+    other_costs: Decimal = ZERO
+    inbound_shipping_vat_rate: Decimal = Decimal("0.20")
+    other_costs_vat_rate: Decimal = Decimal("0.20")
 
     def __post_init__(self) -> None:
         # A scan may contain only unmatched products. Validate settings before
         # any matching or persistence, rather than waiting for a calculation.
-        _decimal(self.packaging_cost, "packaging_cost")
+        for name in ("packaging_cost", "inbound_shipping_cost", "other_costs"):
+            _decimal(getattr(self, name), name)
         for name in (
             "returns_rate", "vat_rate", "amazon_fees_vat_rate", "purchase_vat_rate",
-            "delivery_vat_rate", "packaging_vat_rate",
+            "delivery_vat_rate", "packaging_vat_rate", "inbound_shipping_vat_rate",
+            "other_costs_vat_rate",
         ):
             _rate(getattr(self, name), name)
         for name in ("vat_registered", "reclaim_input_vat"):
@@ -87,6 +100,8 @@ class ProfitResult:
     margin_percent: Decimal | None
     output_vat: Decimal
     recoverable_input_vat: Decimal
+    inbound_shipping: Decimal = ZERO
+    other_costs: Decimal = ZERO
 
 
 def _decimal(value: object, name: str) -> Decimal:
@@ -132,6 +147,8 @@ def calculate_profit(
     Supplier delivery must be allocated to this pack by the import feed, not an
     entire unrelated bulk order. Demand, restrictions and match confidence are
     evaluated separately and do not turn this estimate into a verified deal.
+    Missing price/fee inputs, unknown delivery costs or unknown VAT treatment
+    cannot produce a complete estimate and raise ``ValueError``.
     """
     assumptions = assumptions if assumptions is not None else ProfitAssumptions()
     if not isinstance(assumptions, ProfitAssumptions):
@@ -145,25 +162,40 @@ def calculate_profit(
         raise ValueError("Supplier and Amazon pack quantities must match exactly")
     for name, value in (
         ("supplier_vat_included", product.supplier_vat_included),
+        ("shipping_cost_known", product.shipping_cost_known),
         ("vat_registered", assumptions.vat_registered),
         ("reclaim_input_vat", assumptions.reclaim_input_vat),
     ):
         if not isinstance(value, bool):
             raise ValueError(f"{name} must be a boolean")
+    if not product.shipping_cost_known:
+        raise ValueError("Supplier shipping cost is unknown; estimate is incomplete")
+    treatment = product.vat_treatment
+    if treatment == "unknown":
+        raise ValueError("Supplier VAT treatment is unknown; estimate is incomplete")
+    if treatment not in (None, "included", "excluded", "not_applicable"):
+        raise ValueError("Unsupported supplier vat_treatment")
+    if treatment in ("included", "excluded") and product.supplier_vat_included != (treatment == "included"):
+        raise ValueError("Supplier VAT treatment conflicts with supplier_vat_included")
 
     purchase = _decimal(product.unit_cost, "unit_cost")
     delivery = _decimal(product.delivery_cost, "delivery_cost")
     price = _decimal(listing.price, "price")
     fba = _decimal(listing.fba_fee, "fba_fee")
     packaging = _decimal(assumptions.packaging_cost, "packaging_cost")
+    inbound_shipping = _decimal(assumptions.inbound_shipping_cost, "inbound_shipping_cost")
+    other_costs = _decimal(assumptions.other_costs, "other_costs")
     referral_rate = _rate(listing.referral_fee_rate, "referral_fee_rate")
     rates = {
         name: _rate(getattr(assumptions, name), name)
         for name in (
             "returns_rate", "vat_rate", "amazon_fees_vat_rate",
             "purchase_vat_rate", "delivery_vat_rate", "packaging_vat_rate",
+            "inbound_shipping_vat_rate", "other_costs_vat_rate",
         )
     }
+    if treatment == "not_applicable":
+        rates["purchase_vat_rate"] = rates["delivery_vat_rate"] = ZERO
     reclaim = assumptions.vat_registered and assumptions.reclaim_input_vat
 
     # Extra precision avoids binary floats and intermediate penny rounding.
@@ -185,9 +217,17 @@ def calculate_profit(
             packaging_net, packaging_tax, packaging_gross = _vat_split(
                 packaging, rates["packaging_vat_rate"], True
             )
+            inbound_net, inbound_tax, inbound_gross = _vat_split(
+                inbound_shipping, rates["inbound_shipping_vat_rate"], True
+            )
+            other_net, other_tax, other_gross = _vat_split(
+                other_costs, rates["other_costs_vat_rate"], True
+            )
             purchase_cost = purchase_net if reclaim else purchase_gross
             supplier_delivery = delivery_net if reclaim else delivery_gross
             packaging_cost = packaging_net if reclaim else packaging_gross
+            inbound_shipping_cost = inbound_net if reclaim else inbound_gross
+            extra_costs = other_net if reclaim else other_gross
             referral_fee = _round(sale_price * referral_rate)
             fba_fee = _round(fba)
             fee_tax = _round(referral_fee * rates["amazon_fees_vat_rate"]) + _round(
@@ -195,13 +235,14 @@ def calculate_profit(
             )
             vat_cost = ZERO if reclaim else fee_tax
             recoverable_input_vat = (
-                purchase_tax + delivery_tax + packaging_tax + fee_tax
+                purchase_tax + delivery_tax + packaging_tax + inbound_tax + other_tax + fee_tax
                 if reclaim else ZERO
             )
             returns_allowance = _round(net_revenue * rates["returns_rate"])
             total_cost = sum(
                 (purchase_cost, supplier_delivery, referral_fee, fba_fee,
-                 packaging_cost, returns_allowance, vat_cost), ZERO
+                 packaging_cost, inbound_shipping_cost, extra_costs,
+                 returns_allowance, vat_cost), ZERO
             )
             profit = net_revenue - total_cost
             roi_percent = _round(profit / total_cost * HUNDRED) if total_cost else None
@@ -225,4 +266,6 @@ def calculate_profit(
         margin_percent=margin_percent,
         output_vat=output_vat,
         recoverable_input_vat=recoverable_input_vat,
+        inbound_shipping=inbound_shipping_cost,
+        other_costs=extra_costs,
     )

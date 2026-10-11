@@ -22,9 +22,14 @@ def deal():
         "product_key": "supplier-a:123",
         "qualified": True,
         "simulated": False,
-        "supplier": {"title": "Useful product <test>", "unit_cost": "10.00",
+        "match": {"status": "exact"},
+        "estimate_status": "complete",
+        "supplier": {"title": "Useful product <test>", "unit_cost": "10.00", "is_demo": False,
                      "supplier_url": "https://supplier.example/product/123"},
-        "listing": {"asin": "B012345678", "price": "24.99", "simulated": False},
+        "listing": {"asin": "B012345678", "price": "24.99", "simulated": False,
+                    "referral_fee_rate": "0.15", "fba_fee": "3.0", "fees_confirmed": True,
+                    "identifier_verified": True, "provenance": "manual", "restriction_status": "unknown",
+                    "observed_at": "2026-10-11T12:00:00+00:00", "evidence_source": "Manual listing observation"},
         "profitability": {"profit": "7.15", "roi_percent": "62.1", "margin_percent": "28.6"},
     }
 
@@ -52,6 +57,8 @@ def test_telegram_plaintext_and_secret_redaction(deal, caplog):
 
 def test_simulation_disclosure_and_safe_links(deal):
     deal["simulated"] = True
+    deal["supplier"]["is_demo"] = True
+    deal["listing"].update(simulated=True, provenance="mock")
     deal["supplier"]["supplier_url"] = "http://unsafe.example/product"
     deal["listing"]["listing_url"] = "javascript:alert(1)"
     message = format_deal_message(deal)
@@ -64,6 +71,8 @@ def test_simulation_disclosure_and_safe_links(deal):
 @pytest.mark.parametrize("explicit_url", [None, "https://www.amazon.co.uk/dp/B012345678"])
 def test_simulated_asins_never_link_to_real_amazon_products(deal, explicit_url):
     deal["simulated"] = True
+    deal["supplier"]["is_demo"] = True
+    deal["listing"].update(simulated=True, provenance="mock")
     deal["listing"]["listing_url"] = explicit_url
     message = format_deal_message(deal)
     assert "Simulated ASIN: B012345678" in message
@@ -158,6 +167,11 @@ def test_simulated_and_unqualified_never_sent_without_opt_in(tmp_path, deal):
     assert result["skipped_simulated"] == 1
     assert result["skipped_unqualified"] == 2
     assert not notifier.sent
+    # A real supplier must never trigger a mock-price alert, even after demo opt-in.
+    assert AlertService(tmp_path / "alerts.db", notifier, allow_simulated=True).dispatch([simulated])["skipped_simulated"] == 1
+    simulated["supplier"]["is_demo"] = True
+    simulated["listing"]["provenance"] = "mock"
+    simulated["simulated"] = True
     assert AlertService(tmp_path / "alerts.db", notifier, allow_simulated=True).dispatch([simulated])["sent"] == 1
 
 
@@ -214,3 +228,56 @@ def test_two_scan_instances_reserve_before_network(tmp_path, deal):
 def test_corrupted_identity_is_rejected(tmp_path, deal):
     deal["product_key"] = ""
     assert AlertService(tmp_path / "alerts.db", RecordingNotifier()).dispatch([deal])["invalid"] == 1
+
+
+def test_manual_alert_clearly_reports_observation_and_unknown_eligibility(deal):
+    deal["research_warnings"] = ["Demand and pricing stability are unknown"]
+    message = format_deal_message(deal)
+    assert "REAL SUPPLIER · MANUAL AMAZON OBSERVATION" in message
+    assert "Manual listing observation" in message
+    assert "2026-10-11T12:00:00+00:00" in message
+    assert "Seller eligibility is unknown" in message
+    assert "Demand and pricing stability are unknown" in message
+    assert "verified deal" not in message.lower()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("identifier_verified", False), ("fees_confirmed", False), ("evidence_source", ""),
+    ("price", None), ("referral_fee_rate", None), ("fba_fee", "NaN"),
+    ("price", "-1"), ("referral_fee_rate", "1.1"), ("fba_fee", "-1"),
+    ("restriction_status", "restricted"),
+])
+def test_manual_alert_requires_complete_explicit_evidence(tmp_path, deal, field, value):
+    deal["listing"][field] = value
+    notifier = RecordingNotifier()
+    result = AlertService(tmp_path / "alerts.db", notifier).dispatch([deal])
+    assert result["skipped_unqualified"] == 1
+    assert not notifier.sent
+
+
+def test_incomplete_estimate_never_alerts(tmp_path, deal):
+    deal["estimate_status"] = "incomplete"
+    assert AlertService(tmp_path / "alerts.db", RecordingNotifier()).dispatch([deal])["skipped_unqualified"] == 1
+
+
+def test_missing_explicit_source_is_not_a_real_alert(tmp_path, deal):
+    del deal["supplier"]["is_demo"]
+    assert AlertService(tmp_path / "alerts.db", RecordingNotifier(), allow_simulated=True).dispatch([deal])["skipped_simulated"] == 1
+
+
+def test_direct_telegram_notifier_rejects_real_supplier_mock_combination(deal):
+    deal["listing"].update(simulated=True, provenance="mock")
+    requests = []
+    with httpx.Client(transport=httpx.MockTransport(lambda request: requests.append(request))) as client:
+        with pytest.raises(NotificationError, match="Mixed, unverified or incomplete"):
+            TelegramNotifier("123:private", "chat", client=client).send(deal)
+    assert not requests
+
+
+def test_direct_telegram_notifier_rejects_an_uncertain_match(deal):
+    deal["match"]["status"] = "review"
+    requests = []
+    with httpx.Client(transport=httpx.MockTransport(lambda request: requests.append(request))) as client:
+        with pytest.raises(NotificationError, match="Mixed, unverified or incomplete"):
+            TelegramNotifier("123:private", "chat", client=client).send(deal)
+    assert not requests

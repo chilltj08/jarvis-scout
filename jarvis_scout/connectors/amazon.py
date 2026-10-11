@@ -38,14 +38,31 @@ def validate_listing(listing: AmazonListing) -> None:
             raise ValueError(f"Amazon {name} must be a string (blank requires manual review).")
     if listing.ean is not None and not isinstance(listing.ean, str):
         raise ValueError("Amazon GTIN must be a string or null; do not lose leading zeroes.")
+    if type(listing.simulated) is not bool:
+        raise ValueError("Amazon simulated flag must be a boolean.")
+    if not isinstance(listing.provenance, str) or listing.provenance not in {"mock", "manual", "official"}:
+        raise ValueError("Amazon provenance must be mock, manual or official.")
+    if listing.simulated is not (listing.provenance == "mock"):
+        raise ValueError("Mock Amazon data must be simulated; manual/official observations must not be simulated.")
+    if type(listing.identifier_verified) is not bool or type(listing.fees_confirmed) is not bool:
+        raise ValueError("Amazon identifier_verified and fees_confirmed must be booleans.")
+    if not isinstance(listing.evidence_source, str):
+        raise ValueError("Amazon evidence_source must be a string.")
+    manual = listing.provenance == "manual"
+    if manual and not listing.evidence_source.strip():
+        raise ValueError("Manual Amazon observations require an evidence source.")
     for name in ("price", "referral_fee_rate", "fba_fee"):
         value = getattr(listing, name)
+        if manual and value is None:
+            continue
         if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
             raise ValueError(f"Amazon {name} must be a finite, nonnegative Decimal.")
-    if listing.referral_fee_rate > 1:
+    if listing.referral_fee_rate is not None and listing.referral_fee_rate > 1:
         raise ValueError("Amazon referral_fee_rate must be between 0 and 1.")
     for name in ("demand_confidence", "pricing_stability"):
         value = getattr(listing, name)
+        if manual and value is None:
+            continue
         valid_type = not isinstance(value, bool) and isinstance(value, (int, float, Decimal))
         if not valid_type:
             raise ValueError(f"Amazon {name} must be a finite score between 0 and 1.")
@@ -54,7 +71,8 @@ def validate_listing(listing: AmazonListing) -> None:
         )
         if not finite or not 0 <= value <= 1:
             raise ValueError(f"Amazon {name} must be a finite score between 0 and 1.")
-    if type(listing.competition) is not int or listing.competition < 0:
+    if not (manual and listing.competition is None) and (
+            type(listing.competition) is not int or listing.competition < 0):
         raise ValueError("Amazon competition must be a nonnegative integer.")
     if type(listing.pack_quantity) is not int or listing.pack_quantity < 1:
         raise ValueError("Amazon pack_quantity must be a positive integer.")
@@ -62,8 +80,6 @@ def validate_listing(listing: AmazonListing) -> None:
         "eligible", "restricted", "unknown"
     }:
         raise ValueError("Amazon restriction_status must be eligible, restricted or unknown.")
-    if not isinstance(listing.simulated, bool):
-        raise ValueError("Amazon simulated flag must be a boolean.")
     if not isinstance(listing.observed_at, str):
         raise ValueError("Amazon observed_at must be an ISO timestamp with a timezone.")
     try:
@@ -90,7 +106,9 @@ class MockAmazonAdapter:
         if not isinstance(records, list):
             raise ValueError("Mock Amazon catalog must be a JSON list of simulated listings.")
         self.catalog = [
-            listing_from_dict({**record, "simulated": True, "observed_at": utc_now()})
+            listing_from_dict({**record, "simulated": True, "provenance": "mock",
+                               "identifier_verified": False, "fees_confirmed": False,
+                               "observed_at": utc_now()})
             for record in records
         ]
         for listing in self.catalog:

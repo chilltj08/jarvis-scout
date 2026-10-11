@@ -9,7 +9,7 @@ import signal
 import threading
 
 from jarvis_scout.config import AppConfig
-from jarvis_scout.connectors.amazon import MockAmazonAdapter
+from jarvis_scout.manual import ResearchAmazonAdapter
 from jarvis_scout.database import Database
 from jarvis_scout.filters import OpportunityFilters
 from jarvis_scout.models import json_safe
@@ -30,6 +30,7 @@ def decimal_arg(value: str) -> Decimal:
 
 
 def scan_options(parser):
+    parser.add_argument("--scope", choices=("real", "demo", "all"), default="real", help="Real suppliers use saved manual Amazon observations; demo uses mocks")
     parser.add_argument("--min-profit", type=decimal_arg, default=Decimal("3"))
     parser.add_argument("--min-roi", type=decimal_arg, default=Decimal("30"), help="ROI percent using all modelled costs")
     parser.add_argument("--min-demand", type=float, default=0.5)
@@ -37,6 +38,8 @@ def scan_options(parser):
     parser.add_argument("--max-competition", type=int, default=10)
     parser.add_argument("--max-age-hours", type=float, default=48)
     parser.add_argument("--packaging", type=decimal_arg, default=Decimal("0.50"))
+    parser.add_argument("--inbound-shipping", type=decimal_arg, default=Decimal("0"), help="Additional fulfilment/inbound shipping per pack, VAT inclusive")
+    parser.add_argument("--other-costs", type=decimal_arg, default=Decimal("0"), help="Other expenses per pack, VAT inclusive")
     parser.add_argument("--returns-rate", type=decimal_arg, default=Decimal("0.03"), help="Fraction, e.g. 0.03 means 3%%")
     parser.add_argument("--vat-registered", action="store_true")
     recovery = parser.add_mutually_exclusive_group()
@@ -48,21 +51,26 @@ def scan_options(parser):
     parser.add_argument("--delivery-vat-rate", type=decimal_arg, default=Decimal("0.20"))
     parser.add_argument("--fees-vat-rate", type=decimal_arg, default=Decimal("0.20"))
     parser.add_argument("--packaging-vat-rate", type=decimal_arg, default=Decimal("0.20"))
+    parser.add_argument("--inbound-vat-rate", type=decimal_arg, default=Decimal("0.20"))
+    parser.add_argument("--other-costs-vat-rate", type=decimal_arg, default=Decimal("0.20"))
+    parser.add_argument("--require-market-signals", action="store_true", help="Exclude research without demand, stability and competition evidence")
+    parser.add_argument("--require-eligible", action="store_true", help="Exclude candidates with unknown seller eligibility")
     parser.add_argument("--alerts", action="store_true", help="Explicitly send qualifying items through Telegram")
     parser.add_argument("--allow-simulated-alerts", action="store_true", help="Opt in to clearly SIMULATED demo alerts; requires --alerts")
 
 
 def main(argv=None) -> int:
     config = AppConfig.from_env()
-    parser = argparse.ArgumentParser(prog="jarvis_scout", description="JARVIS SCOUT — UK resale research; bundled Amazon data is SIMULATED")
+    parser = argparse.ArgumentParser(prog="jarvis_scout", description="JARVIS SCOUT — real supplier research and manual Amazon comparisons; demo data is SIMULATED")
     parser.add_argument("--db", default=str(config.db_path), help="Local SQLite path")
     commands = parser.add_subparsers(dest="command", required=True)
     importer = commands.add_parser("import-csv", help="Import valid rows; report invalid rows")
     importer.add_argument("path")
     importer.add_argument("--source")
+    importer.add_argument("--demo", action="store_true", help="Explicitly mark these supplier rows as fictional demo data")
     commands.add_parser("demo", help="Import fictional products and run a simulated scan; no alerts")
     commands.add_parser("history", help="Show scan summaries")
-    scan_parser = commands.add_parser("scan", help="Scan imported products against the simulated catalog")
+    scan_parser = commands.add_parser("scan", help="Evaluate supplier products using recorded manual comparisons")
     scan_options(scan_parser)
     watch_parser = commands.add_parser("watch", help="Repeat scans sequentially; Ctrl+C stops")
     scan_options(watch_parser)
@@ -71,31 +79,37 @@ def main(argv=None) -> int:
     try:
         db = Database(args.db)
         if args.command == "import-csv":
-            report = import_feed(args.path, db, args.source)
+            report = import_feed(args.path, db, args.source, is_demo=args.demo)
             print(json.dumps(json_safe(report), indent=2))
             return 2 if report.errors else 0
         if args.command == "history":
             print(json.dumps(db.list_scans(), indent=2))
             return 0
         if args.command == "demo":
-            report = import_feed(config.feed_path, db)
+            report = import_feed(config.feed_path, db, is_demo=True)
             if report.errors:
                 raise ValueError("Demo feed errors: " + "; ".join(report.errors))
             assumptions, filters = ProfitAssumptions(), OpportunityFilters()
+            scope = True
         else:
+            scope = {"real": False, "demo": True, "all": None}[args.scope]
             assumptions = ProfitAssumptions(
                 packaging_cost=args.packaging, returns_rate=args.returns_rate,
                 vat_registered=args.vat_registered, reclaim_input_vat=args.reclaim_vat,
                 vat_rate=args.vat_rate, purchase_vat_rate=args.purchase_vat_rate,
                 delivery_vat_rate=args.delivery_vat_rate, amazon_fees_vat_rate=args.fees_vat_rate,
                 packaging_vat_rate=args.packaging_vat_rate,
+                inbound_shipping_cost=args.inbound_shipping, other_costs=args.other_costs,
+                inbound_shipping_vat_rate=args.inbound_vat_rate, other_costs_vat_rate=args.other_costs_vat_rate,
             )
             filters = OpportunityFilters(args.min_profit, args.min_roi, args.min_demand, args.min_stability,
-                                         args.max_competition, args.max_age_hours)
+                                         args.max_competition, args.max_age_hours,
+                                         require_eligible=args.require_eligible or scope is True,
+                                         require_market_signals=args.require_market_signals or scope is True)
             if args.allow_simulated_alerts and not args.alerts:
                 raise ValueError("--allow-simulated-alerts requires --alerts")
-        if not db.products():
-            raise ValueError("No supplier products imported. Run demo or import-csv first.")
+        if not db.products(is_demo=scope):
+            raise ValueError("No supplier products in this scope. Import a real CSV first, or run demo and scan --scope demo.")
         alerts = None
         if getattr(args, "alerts", False):
             notifier = TelegramNotifier()
@@ -106,14 +120,15 @@ def main(argv=None) -> int:
 
         def scan_once():
             try:
-                result = run_scan(db, MockAmazonAdapter(config.amazon_catalog_path), assumptions, filters)
+                result = run_scan(db, ResearchAmazonAdapter(db, config.amazon_catalog_path), assumptions, filters, is_demo=scope)
             except Exception as error:
                 if args.command == "watch":
                     print(json.dumps({"scan_status": "failed", "error_type": type(error).__name__}), flush=True)
                 raise
             summary = {"scan_id": result.scan_id, "total": result.total, "qualified": result.qualified,
                        "review": result.review, "unmatched": result.unmatched,
-                       "data_mode": "SIMULATED — no live Amazon market checks"}
+                       "incomplete": sum(row["estimate_status"] == "incomplete" for row in result.records),
+                       "data_mode": "SIMULATED — demo only" if scope is True else ("REAL SUPPLIERS — manual observations; no live market checks" if scope is False else "MIXED — real research and labelled SIMULATED demonstrations")}
             if alerts:
                 summary["alerts"] = alerts.dispatch(result.records)
             print(json.dumps(summary), flush=True)

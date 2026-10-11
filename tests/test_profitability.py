@@ -164,13 +164,13 @@ def test_invalid_supplier_money_is_rejected(field, value):
 
 
 @pytest.mark.parametrize("field", ["price", "fba_fee"])
-@pytest.mark.parametrize("value", [Decimal("-1"), Decimal("NaN"), Decimal("Infinity")])
+@pytest.mark.parametrize("value", [Decimal("-1"), Decimal("NaN"), Decimal("Infinity"), None, True, "bad"])
 def test_invalid_amazon_money_is_rejected(field, value):
     with pytest.raises(ValueError, match=field):
         calculate_profit(supplier(), listing(**{field: value}))
 
 
-@pytest.mark.parametrize("value", [Decimal("-0.01"), Decimal("1.01"), Decimal("NaN")])
+@pytest.mark.parametrize("value", [Decimal("-0.01"), Decimal("1.01"), Decimal("NaN"), None])
 def test_invalid_referral_rates_are_rejected(value):
     with pytest.raises(ValueError, match="referral_fee_rate"):
         calculate_profit(supplier(), listing(referral_fee_rate=value))
@@ -178,7 +178,8 @@ def test_invalid_referral_rates_are_rejected(value):
 
 @pytest.mark.parametrize("field", [
     "returns_rate", "vat_rate", "amazon_fees_vat_rate", "purchase_vat_rate",
-    "delivery_vat_rate", "packaging_vat_rate",
+    "delivery_vat_rate", "packaging_vat_rate", "inbound_shipping_vat_rate",
+    "other_costs_vat_rate",
 ])
 @pytest.mark.parametrize("value", [Decimal("-0.01"), Decimal("1.01"), Decimal("Infinity")])
 def test_invalid_assumption_rates_are_rejected(field, value):
@@ -186,10 +187,11 @@ def test_invalid_assumption_rates_are_rejected(field, value):
         calculate_profit(supplier(), listing(), ProfitAssumptions(**{field: value}))
 
 
-@pytest.mark.parametrize("value", [Decimal("-1"), Decimal("NaN"), "broken"])
-def test_invalid_packaging_is_rejected(value):
-    with pytest.raises(ValueError, match="packaging_cost"):
-        calculate_profit(supplier(), listing(), ProfitAssumptions(packaging_cost=value))
+@pytest.mark.parametrize("field", ["packaging_cost", "inbound_shipping_cost", "other_costs"])
+@pytest.mark.parametrize("value", [Decimal("-1"), Decimal("NaN"), Decimal("Infinity"), None, True, "broken"])
+def test_invalid_extra_costs_are_rejected_before_scanning(field, value):
+    with pytest.raises(ValueError, match=field):
+        ProfitAssumptions(**{field: value})
 
 
 @pytest.mark.parametrize("value", [0, -1, True, 1.5])
@@ -220,3 +222,104 @@ def test_boolean_assumptions_do_not_accept_truthy_strings(field):
 def test_supplier_vat_inclusion_must_be_an_actual_boolean():
     with pytest.raises(ValueError, match="supplier_vat_included"):
         calculate_profit(supplier(supplier_vat_included="false"), listing())
+
+
+def test_non_registered_shipping_and_other_costs_are_investment_costs():
+    result = calculate_profit(supplier(), listing(), ProfitAssumptions(
+        inbound_shipping_cost=Decimal("2.40"), other_costs=Decimal("1.20"),
+    ))
+    assert result.inbound_shipping == Decimal("2.40")
+    assert result.other_costs == Decimal("1.20")
+    assert result.total_cost == Decimal("25.00")
+    assert result.profit == Decimal("5.00")
+    assert result.roi_percent == Decimal("20.00")
+    assert result.margin_percent == Decimal("16.67")
+    assert result.recoverable_input_vat == Decimal("0.00")
+
+
+def test_registered_shipping_and_other_costs_reconcile_with_recovered_vat():
+    result = calculate_profit(supplier(), listing(), ProfitAssumptions(
+        vat_registered=True, inbound_shipping_cost=Decimal("2.40"),
+        other_costs=Decimal("1.20"),
+    ))
+    assert result.inbound_shipping == Decimal("2.00")
+    assert result.other_costs == Decimal("1.00")
+    assert result.recoverable_input_vat == Decimal("4.02")
+    assert result.total_cost == Decimal("20.83")
+    assert result.profit == Decimal("4.17")
+    assert result.roi_percent == Decimal("20.02")
+    assert result.margin_percent == Decimal("16.68")
+    assert sum((result.purchase_cost, result.supplier_delivery, result.referral_fee,
+                result.fba_fee, result.packaging, result.inbound_shipping,
+                result.other_costs, result.returns_allowance, result.vat_cost)) == result.total_cost
+    # Gross customer receipt reconciles with every cost and tax outflow.
+    assert result.sale_price - result.output_vat - result.total_cost == result.profit
+
+
+def test_extra_costs_vat_is_not_recovered_without_eligible_invoices():
+    result = calculate_profit(supplier(), listing(), ProfitAssumptions(
+        vat_registered=True, reclaim_input_vat=False,
+        inbound_shipping_cost=Decimal("2.40"), other_costs=Decimal("1.20"),
+    ))
+    assert result.inbound_shipping == Decimal("2.40")
+    assert result.other_costs == Decimal("1.20")
+    assert result.total_cost == Decimal("24.85")
+    assert result.profit == Decimal("0.15")
+    assert result.recoverable_input_vat == Decimal("0.00")
+
+
+def test_explicit_zero_extra_cost_vat_retains_whole_input_cost_for_registrant():
+    result = calculate_profit(supplier(), listing(), ProfitAssumptions(
+        vat_registered=True, inbound_shipping_cost=Decimal("2.40"),
+        other_costs=Decimal("1.20"), inbound_shipping_vat_rate=Decimal("0"),
+        other_costs_vat_rate=Decimal("0"),
+    ))
+    assert result.inbound_shipping == Decimal("2.40")
+    assert result.other_costs == Decimal("1.20")
+    assert result.recoverable_input_vat == Decimal("3.42")
+
+
+@pytest.mark.parametrize("vat_registered", [False, True])
+def test_supplier_not_charging_vat_never_adds_or_recovers_supplier_vat(vat_registered):
+    # The explicit supplier treatment wins over default 20% input rates.
+    result = calculate_profit(
+        supplier(vat_treatment="not_applicable", supplier_vat_included=False), listing(),
+        ProfitAssumptions(vat_registered=vat_registered),
+    )
+    assert result.purchase_cost == Decimal("10.00")
+    assert result.supplier_delivery == Decimal("1.00")
+    assert result.recoverable_input_vat == (Decimal("1.58") if vat_registered else Decimal("0.00"))
+    assert result.total_cost == (Decimal("19.67") if vat_registered else Decimal("21.40"))
+
+
+@pytest.mark.parametrize("treatment,included", [("included", False), ("excluded", True)])
+def test_conflicting_explicit_supplier_vat_assumptions_are_rejected(treatment, included):
+    with pytest.raises(ValueError, match="conflicts"):
+        calculate_profit(supplier(vat_treatment=treatment, supplier_vat_included=included), listing())
+
+
+def test_unknown_supplier_vat_marks_calculation_incomplete():
+    with pytest.raises(ValueError, match="VAT treatment is unknown.*incomplete"):
+        calculate_profit(supplier(vat_treatment="unknown"), listing())
+
+
+def test_unknown_shipping_cannot_be_silently_assumed_zero():
+    with pytest.raises(ValueError, match="shipping cost is unknown.*incomplete"):
+        calculate_profit(supplier(shipping_cost_known=False, delivery_cost=Decimal("0")), listing())
+
+
+def test_shipping_known_requires_actual_boolean():
+    with pytest.raises(ValueError, match="shipping_cost_known"):
+        calculate_profit(supplier(shipping_cost_known="false"), listing())
+
+
+@pytest.mark.parametrize("field", ["price", "referral_fee_rate", "fba_fee"])
+def test_missing_manual_listing_inputs_reject_incomplete_estimate(field):
+    with pytest.raises(ValueError, match=field):
+        calculate_profit(supplier(is_demo=False), listing(simulated=False, **{field: None}))
+
+
+def test_bulk_minimum_order_changes_commitment_not_per_pack_profit():
+    base = calculate_profit(supplier(), listing())
+    bulk = calculate_profit(supplier(minimum_order_quantity=24, shipping_cost=Decimal("24")), listing())
+    assert bulk == base  # £1 delivery per pack is already allocated from the £24 order.

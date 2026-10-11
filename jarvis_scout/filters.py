@@ -15,6 +15,8 @@ class OpportunityFilters:
     min_pricing_stability: float = 0.5
     max_competition: int = 10
     max_data_age_hours: float = 48
+    require_eligible: bool = True
+    require_market_signals: bool = True
 
     def __post_init__(self):
         for name in ("min_profit", "min_roi_percent"):
@@ -28,6 +30,9 @@ class OpportunityFilters:
             raise ValueError("max_competition must be a nonnegative integer")
         if not math.isfinite(self.max_data_age_hours) or self.max_data_age_hours <= 0:
             raise ValueError("max_data_age_hours must be positive")
+        for name in ("require_eligible", "require_market_signals"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
 
 
 def _fresh(timestamp: str, hours: float) -> bool:
@@ -45,32 +50,51 @@ def evaluate_opportunity(product: SupplierProduct, listing: AmazonListing, profi
     reasons = []
     # Adapters may provide Decimal probabilities; scores are ranking inputs,
     # while monetary calculations remain Decimal throughout.
-    demand_confidence = float(listing.demand_confidence)
-    pricing_stability = float(listing.pricing_stability)
-    if profit.profit < filters.min_profit:
+    demand_confidence = (Decimal(str(listing.demand_confidence))
+                         if listing.demand_confidence is not None else None)
+    pricing_stability = (Decimal(str(listing.pricing_stability))
+                         if listing.pricing_stability is not None else None)
+    if profit.profit is None or profit.profit < filters.min_profit:
         reasons.append("Profit below minimum")
     if profit.roi_percent is None or profit.roi_percent < filters.min_roi_percent:
         reasons.append("ROI below minimum or undefined")
-    if demand_confidence < filters.min_demand_confidence:
+    if demand_confidence is None:
+        if filters.require_market_signals:
+            reasons.append("Demand confidence is unknown")
+    elif demand_confidence < Decimal(str(filters.min_demand_confidence)):
         reasons.append("Demand confidence below minimum")
-    if pricing_stability < filters.min_pricing_stability:
+    if pricing_stability is None:
+        if filters.require_market_signals:
+            reasons.append("Pricing stability is unknown")
+    elif pricing_stability < Decimal(str(filters.min_pricing_stability)):
         reasons.append("Pricing stability below minimum")
-    if listing.competition > filters.max_competition:
+    if listing.competition is None:
+        if filters.require_market_signals:
+            reasons.append("Competition is unknown")
+    elif listing.competition > filters.max_competition:
         reasons.append("Competition above maximum")
-    if listing.restriction_status != "eligible":
+    if listing.restriction_status == "restricted" or (
+            filters.require_eligible and listing.restriction_status != "eligible"):
         reasons.append("Listing eligibility is restricted or unverified")
-    if product.available_quantity == 0:
+    if product.available_quantity == 0 or product.stock_status in {"out_of_stock", "preorder"}:
         reasons.append("Supplier reports out of stock")
+    elif (product.available_quantity is not None
+          and product.available_quantity < product.minimum_order_quantity):
+        reasons.append("Supplier stock is below minimum order quantity")
     if not _fresh(product.observed_at, filters.max_data_age_hours):
         reasons.append("Supplier observation is stale or invalid")
     if not _fresh(listing.observed_at, filters.max_data_age_hours):
         reasons.append("Amazon observation is stale or invalid")
-    # Ranking is a heuristic, never a sales-volume prediction. Eligibility is a hard gate.
+    # Ranking is a heuristic, never a sales-volume prediction. Explicit
+    # restrictions always block; unknown eligibility can be allowed for research.
     roi = max(0, min(float(profit.roi_percent or 0) / 100, 1))
-    money = max(0, min(float(profit.profit) / 15, 1))
-    competition = 1 / (1 + listing.competition)
-    score = round(100 * (0.25 * roi + 0.25 * money + 0.20 * demand_confidence
-                         + 0.20 * pricing_stability + 0.10 * competition), 1)
-    if listing.restriction_status != "eligible":
+    money = max(0, min(float(profit.profit or 0) / 15, 1))
+    competition = 1 / (1 + listing.competition) if listing.competition is not None else 0
+    # Missing market evidence contributes no ranking points; no demand or
+    # competition is inferred from a user's price observation.
+    score = round(100 * (0.25 * roi + 0.25 * money + 0.20 * float(demand_confidence or 0)
+                         + 0.20 * float(pricing_stability or 0) + 0.10 * competition), 1)
+    if listing.restriction_status == "restricted" or (
+            filters.require_eligible and listing.restriction_status != "eligible"):
         score = 0.0
     return not reasons, reasons, score

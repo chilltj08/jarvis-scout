@@ -90,11 +90,11 @@ def test_module_import_scan_and_history_persist_across_processes(module_cli, tmp
     feed = local_folder / "supplier stock.csv"
     shutil.copyfile(PROJECT_ROOT / "data" / "supplier_demo.csv", feed)
     database = local_folder / "scout history.sqlite3"
-    imported = module_cli("--db", database, "import-csv", feed, "--source", "Local CSV")
+    imported = module_cli("--db", database, "import-csv", feed, "--source", "Local CSV", "--demo")
     assert imported.returncode == 0, imported.stderr
     assert json.loads(imported.stdout) == {"imported": 8, "errors": []}
 
-    scanned = module_cli("--db", database, "scan", "--min-profit", "1.25", "--min-roi", "10")
+    scanned = module_cli("--db", database, "scan", "--scope", "demo", "--min-profit", "1.25", "--min-roi", "10")
     assert scanned.returncode == 0, scanned.stderr
     summary = json.loads(scanned.stdout)
     assert summary["total"] == 8 and summary["scan_id"] == 1
@@ -106,7 +106,7 @@ def test_module_import_scan_and_history_persist_across_processes(module_cli, tmp
     assert len(rows) == 1 and rows[0]["scan_id"] == summary["scan_id"]
     assert rows[0]["settings"]["filters"]["min_profit"] == "1.25"
     assert rows[0]["settings"]["filters"]["min_roi_percent"] == "10"
-    assert rows[0]["settings"]["adapter"] == "MockAmazonAdapter"
+    assert rows[0]["settings"]["adapter"] == "ResearchAmazonAdapter"
     assert {product.source for product in Database(database).products()} == {"Local CSV"}
 
 
@@ -160,7 +160,7 @@ def test_watch_integrates_scheduler_and_database_without_alerts(
     main(["--db", str(database), "demo"])
     capsys.readouterr()
     previous_handler = signal.getsignal(signal.SIGINT)
-    assert main(["--db", str(database), "watch", *interval_argument]) == 0
+    assert main(["--db", str(database), "watch", "--scope", "demo", *interval_argument]) == 0
     output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert len(output) == 2 and all(row["total"] == 8 for row in output)
     assert all("SIMULATED" in row["data_mode"] and "alerts" not in row for row in output)
@@ -184,11 +184,11 @@ def test_cli_alert_optin_persists_deduplication_without_network(tmp_path, monkey
     database = tmp_path / "alert history.sqlite3"
     main(["--db", str(database), "demo"])
     capsys.readouterr()
-    assert main(["--db", str(database), "scan", "--alerts"]) == 0
+    assert main(["--db", str(database), "scan", "--scope", "demo", "--alerts"]) == 0
     blocked = json.loads(capsys.readouterr().out)
     assert blocked["alerts"]["skipped_simulated"] == 1 and not sent
 
-    arguments = ["--db", str(database), "scan", "--alerts", "--allow-simulated-alerts"]
+    arguments = ["--db", str(database), "scan", "--scope", "demo", "--alerts", "--allow-simulated-alerts"]
     assert main(arguments) == 0
     first = json.loads(capsys.readouterr().out)
     assert main(arguments) == 0
@@ -212,7 +212,7 @@ def test_cli_alerts_require_credentials_without_leaking_values(tmp_path, monkeyp
     main(["--db", str(database), "demo"])
     capsys.readouterr()
     with pytest.raises(SystemExit) as error:
-        main(["--db", str(database), "scan", "--alerts"])
+        main(["--db", str(database), "scan", "--scope", "demo", "--alerts"])
     assert error.value.code == 2
     output = capsys.readouterr()
     assert "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID securely" in output.err
@@ -254,7 +254,7 @@ def test_unmatched_products_cannot_hide_invalid_cost_assumptions(tmp_path, capsy
     db.upsert_products(products)
     capsys.readouterr()
     with pytest.raises(SystemExit) as error:
-        main(["--db", str(database), command, option, value])
+        main(["--db", str(database), command, "--scope", "demo", option, value])
     assert error.value.code == 2
     assert expected in capsys.readouterr().err
     assert len(db.list_scans()) == 1
@@ -273,7 +273,155 @@ def test_cli_input_vat_recovery_requires_explicit_optin(tmp_path, capsys):
     from jarvis_scout.database import Database
     path = str(tmp_path / "scout.sqlite3")
     main(["--db", path, "demo"])
-    main(["--db", path, "scan", "--vat-registered"])
+    main(["--db", path, "scan", "--scope", "demo", "--vat-registered"])
     assert not Database(path).list_scans()[0]["settings"]["assumptions"]["reclaim_input_vat"]
-    main(["--db", path, "scan", "--vat-registered", "--reclaim-vat"])
+    main(["--db", path, "scan", "--scope", "demo", "--vat-registered", "--reclaim-vat"])
     assert Database(path).list_scans()[0]["settings"]["assumptions"]["reclaim_input_vat"]
+
+
+def write_real_supplier_csv(path):
+    import csv
+    from datetime import datetime, timezone
+    columns = (
+        "supplier_name", "product_title", "brand", "ean", "sku", "unit_cost", "currency",
+        "vat_treatment", "minimum_order_quantity", "pack_quantity", "shipping_cost",
+        "stock_status", "product_url", "observed_at",
+    )
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        writer.writerow((
+            "Authorised CSV supplier", "Recorded storage box", "Northline Storage", "9990000000012",
+            "real-sku", "9.99", "GBP", "included", "2", "1", "4.00", "in_stock",
+            "https://example.com/supplier/product", datetime.now(timezone.utc).isoformat(),
+        ))
+
+
+def save_cli_manual_comparison(database, price="50.00"):
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from jarvis_scout.manual import create_manual_listing
+    db = Database(database)
+    product = db.products(is_demo=False)[0]
+    listing = create_manual_listing(
+        asin="B0MANUAL01", title="Recorded storage box", brand="Northline Storage",
+        ean="9990000000012", pack_quantity=1, price=Decimal(price),
+        observed_at=datetime.now(timezone.utc).isoformat(),
+        evidence_source="Dated UK offer screenshot and verified product barcode",
+        referral_fee_rate=Decimal("0.15"), fulfilment_fee=Decimal("3.20"),
+        identifier_verified=True, fees_confirmed=True,
+    )
+    db.save_manual_comparison(product.product_key, listing)
+
+
+def test_cli_real_import_and_default_scan_cannot_inherit_demo_price(module_cli, tmp_path):
+    database = tmp_path / "real history.sqlite3"
+    feed = tmp_path / "supplier.csv"
+    write_real_supplier_csv(feed)
+    assert module_cli("--db", database, "demo").returncode == 0
+    imported = module_cli("--db", database, "import-csv", feed)
+    assert imported.returncode == 0, imported.stderr
+    assert json.loads(imported.stdout) == {"imported": 1, "errors": []}
+    scanned = module_cli("--db", database, "scan")
+    assert scanned.returncode == 0, scanned.stderr
+    summary = json.loads(scanned.stdout)
+    assert summary["total"] == 1 and summary["qualified"] == 0 and summary["incomplete"] == 1
+    assert "REAL SUPPLIERS" in summary["data_mode"]
+    assert "SIMULATED" not in summary["data_mode"]
+    row = Database(database).opportunities(summary["scan_id"])[0]
+    assert row["listing"] is None and row["profitability"] is None
+    assert row["supplier"]["unit_cost"] == "9.99" and not row["supplier"]["is_demo"]
+
+
+def test_cli_saved_manual_observation_works_without_seller_central(module_cli, tmp_path):
+    database = tmp_path / "manual comparison.sqlite3"
+    feed = tmp_path / "supplier.csv"
+    write_real_supplier_csv(feed)
+    assert module_cli("--db", database, "import-csv", feed).returncode == 0
+    save_cli_manual_comparison(database)
+    result = module_cli("--db", database, "scan", "--inbound-shipping", "1.00", "--other-costs", "0.25")
+    assert result.returncode == 0, result.stderr
+    summary = json.loads(result.stdout)
+    assert summary["total"] == 1 and summary["qualified"] == 1 and summary["incomplete"] == 0
+    assert "REAL SUPPLIERS" in summary["data_mode"] and "alerts" not in summary
+    db = Database(database)
+    saved = db.opportunities(summary["scan_id"])[0]
+    assert saved["listing"]["price"] == "50.00" and saved["listing"]["provenance"] == "manual"
+    assert saved["profitability"]["profit"] == "21.92"
+    assert db.list_scans()[0]["settings"]["scope"] == "real"
+    assert db.list_scans()[0]["settings"]["assumptions"]["inbound_shipping_cost"] == "1.00"
+
+
+def test_cli_strict_evidence_flags_exclude_unverified_market_signals(module_cli, tmp_path):
+    database = tmp_path / "strict.sqlite3"
+    feed = tmp_path / "supplier.csv"
+    write_real_supplier_csv(feed)
+    assert module_cli("--db", database, "import-csv", feed).returncode == 0
+    save_cli_manual_comparison(database)
+    result = module_cli("--db", database, "scan", "--require-market-signals", "--require-eligible")
+    assert result.returncode == 0, result.stderr
+    summary = json.loads(result.stdout)
+    assert summary["qualified"] == 0 and summary["incomplete"] == 0
+    row = Database(database).opportunities(summary["scan_id"])[0]
+    assert row["profitability"] is not None
+    assert {"Demand confidence is unknown", "Pricing stability is unknown", "Competition is unknown",
+            "Listing eligibility is restricted or unverified"}.issubset(set(row["filter_reasons"]))
+
+
+def test_cli_watch_reads_new_manual_evidence_without_renewing_supplier_time(tmp_path, monkeypatch, capsys):
+    database = tmp_path / "watch research.sqlite3"
+    feed = tmp_path / "supplier.csv"
+    write_real_supplier_csv(feed)
+    assert main(["--db", str(database), "import-csv", str(feed)]) == 0
+    save_cli_manual_comparison(database)
+    db = Database(database)
+    original_observation = db.products(is_demo=False)[0].observed_at
+
+    def change_evidence_between_scans(_delay):
+        save_cli_manual_comparison(database, price="15.00")
+        return False
+
+    class FiniteScheduler(Scheduler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, wait=change_evidence_between_scans, **kwargs)
+
+        def run(self):
+            return super().run(max_iterations=2)
+
+    monkeypatch.setattr(cli, "Scheduler", FiniteScheduler)
+    capsys.readouterr()
+    assert main(["--db", str(database), "watch", "--interval", "0.001"]) == 0
+    summaries = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [row["qualified"] for row in summaries] == [1, 0]
+    assert all(row["total"] == 1 and "REAL SUPPLIERS" in row["data_mode"] for row in summaries)
+    assert db.opportunities(summaries[0]["scan_id"])[0]["listing"]["price"] == "50.00"
+    assert db.opportunities(summaries[1]["scan_id"])[0]["listing"]["price"] == "15.00"
+    assert db.products(is_demo=False)[0].observed_at == original_observation
+
+
+def test_cli_manual_research_alerts_keep_real_evidence_and_persistent_cooldown(tmp_path, monkeypatch, capsys):
+    sent = []
+
+    class LocalNotifier:
+        configured = True
+
+        def send(self, opportunity):
+            sent.append(opportunity)
+
+    database = tmp_path / "real alert history.sqlite3"
+    feed = tmp_path / "supplier.csv"
+    write_real_supplier_csv(feed)
+    assert main(["--db", str(database), "import-csv", str(feed)]) == 0
+    save_cli_manual_comparison(database)
+    monkeypatch.setattr(cli, "TelegramNotifier", LocalNotifier)
+    monkeypatch.setenv("SCOUT_ALERT_COOLDOWN_HOURS", "24")
+    capsys.readouterr()
+    arguments = ["--db", str(database), "scan", "--alerts"]
+    assert main(arguments) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert main(arguments) == 0
+    repeated = json.loads(capsys.readouterr().out)
+    assert first["alerts"]["sent"] == 1 and repeated["alerts"]["suppressed"] == 1
+    assert len(sent) == 1
+    assert sent[0]["data_mode"] == "real" and sent[0]["listing"]["provenance"] == "manual"
+    assert sent[0]["supplier"]["is_demo"] is False and sent[0]["simulated"] is False

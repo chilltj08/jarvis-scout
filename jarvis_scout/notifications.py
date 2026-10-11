@@ -74,12 +74,61 @@ def _number(value: Any, *, money: bool = False) -> str:
         return "unavailable"
 
 
+def _provenance(opportunity: dict[str, Any]) -> str:
+    """Require consistent, explicit source markers before allowing alerts."""
+    supplier, listing = opportunity.get("supplier"), opportunity.get("listing")
+    if not isinstance(supplier, dict) or not isinstance(listing, dict):
+        return "unknown"
+    if (supplier.get("is_demo") is True and listing.get("simulated") is True
+            and listing.get("provenance") == "mock" and opportunity.get("simulated") is True):
+        return "demo"
+    if (supplier.get("is_demo") is False and listing.get("simulated") is False
+            and isinstance(listing.get("provenance"), str)
+            and listing.get("provenance") in {"manual", "official"}
+            and opportunity.get("simulated") is False):
+        return "real"
+    # In particular, opting into demos never permits real supplier products to
+    # be advertised using invented Amazon prices.
+    return "unknown"
+
+
 def is_simulated(opportunity: dict[str, Any]) -> bool:
-    """Missing provenance is conservatively treated as simulated."""
-    listing = opportunity.get("listing")
-    if not isinstance(listing, dict):
-        return True
-    return opportunity.get("simulated", True) is not False or listing.get("simulated", True) is not False
+    """Mixed or missing source provenance cannot establish real research."""
+    return _provenance(opportunity) != "real"
+
+
+def _finite_number(value: Any) -> bool:
+    if isinstance(value, bool) or value is None:
+        return False
+    try:
+        return Decimal(str(value)).is_finite()
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
+def _complete_real_evidence(opportunity: dict[str, Any]) -> bool:
+    listing = opportunity.get("listing", {})
+    profitability = opportunity.get("profitability")
+    match = opportunity.get("match")
+    if (opportunity.get("qualified") is not True or not isinstance(match, dict)
+            or match.get("status") != "exact"
+            or listing.get("identifier_verified") is not True or listing.get("fees_confirmed") is not True
+            or not isinstance(listing.get("evidence_source"), str)
+            or not listing["evidence_source"].strip()
+            or listing.get("restriction_status") == "restricted"
+            or not isinstance(profitability, dict)):
+        return False
+    if opportunity.get("estimate_status", "complete") != "complete":
+        return False
+    if opportunity.get("complete_estimate", True) is not True:
+        return False
+    if not all(_finite_number(listing.get(name)) for name in ("price", "referral_fee_rate", "fba_fee")):
+        return False
+    if any(Decimal(str(listing[name])) < 0 for name in ("price", "referral_fee_rate", "fba_fee")):
+        return False
+    if Decimal(str(listing["referral_fee_rate"])) > 1:
+        return False
+    return all(_finite_number(profitability.get(name)) for name in ("profit", "roi_percent", "margin_percent"))
 
 
 def format_deal_message(opportunity: dict[str, Any]) -> str:
@@ -88,8 +137,15 @@ def format_deal_message(opportunity: dict[str, Any]) -> str:
     profitability = opportunity.get("profitability", {})
     simulated = is_simulated(opportunity)
     title = str(supplier.get("title", "Product"))[:300]
+    if not simulated:
+        observation = "MANUAL AMAZON OBSERVATION" if listing.get("provenance") == "manual" else "AMAZON API OBSERVATION"
+        heading = f"JARVIS SCOUT · REAL SUPPLIER · {observation}"
+    elif supplier.get("is_demo") is False:
+        heading = "JARVIS SCOUT · REAL SUPPLIER · UNVERIFIED/SIMULATED AMAZON DATA"
+    else:
+        heading = "JARVIS SCOUT · SIMULATED DEMO"
     lines = [
-        "JARVIS SCOUT · SIMULATED DEMO" if simulated else "JARVIS SCOUT · Resale candidate",
+        heading,
         title,
         f"Supplier cost: {_number(supplier.get('unit_cost'), money=True)}",
         f"Amazon price: {_number(listing.get('price'), money=True)}",
@@ -110,6 +166,15 @@ def format_deal_message(opportunity: dict[str, Any]) -> str:
     supplier_url = _https_url(supplier.get("supplier_url"))
     if supplier_url:
         lines.append(f"Supplier: {supplier_url[:1000]}")
+    if not simulated:
+        lines.append(f"Amazon observed: {str(listing.get('observed_at', 'unknown'))[:100]}")
+        lines.append(f"Evidence: {str(listing.get('evidence_source', 'unknown'))[:500]}")
+        lines.append(f"Listing eligibility: {str(listing.get('restriction_status', 'unknown'))[:100]}")
+        warnings = opportunity.get("research_warnings", opportunity.get("warnings", []))
+        if isinstance(warnings, list):
+            lines.extend(f"Research warning: {str(warning)[:300]}" for warning in warnings[:5])
+        if listing.get("restriction_status", "unknown") == "unknown":
+            lines.append("Seller eligibility is unknown; this is a financial research candidate.")
     lines.append("Verify prices, eligibility and costs before purchasing.")
     if simulated:
         lines.append("Demonstration only: Amazon prices and demand are simulated.")
@@ -139,6 +204,9 @@ class TelegramNotifier:
     def send(self, opportunity: dict[str, Any]) -> None:
         if not self.configured:
             raise NotificationError("Telegram credentials are missing; configure environment variables.")
+        if _provenance(opportunity) == "unknown" or (
+                _provenance(opportunity) == "real" and not _complete_real_evidence(opportunity)):
+            raise NotificationError("Mixed, unverified or incomplete evidence cannot be sent as an opportunity.")
         payload = {"chat_id": self._chat_id, "text": format_deal_message(opportunity),
                    "disable_web_page_preview": True}
         # Never include this URL in an exception or log: it contains the token.
@@ -252,11 +320,15 @@ class AlertService:
                 report["skipped_unqualified"] += 1
                 continue
             match = opportunity.get("match")
-            if isinstance(match, dict) and match.get("status", "exact") != "exact":
+            if not isinstance(match, dict) or match.get("status") != "exact":
                 report["skipped_unqualified"] += 1
                 continue
-            if is_simulated(opportunity) and not self.allow_simulated:
+            provenance = _provenance(opportunity)
+            if provenance == "unknown" or (provenance == "demo" and not self.allow_simulated):
                 report["skipped_simulated"] += 1
+                continue
+            if provenance == "real" and not _complete_real_evidence(opportunity):
+                report["skipped_unqualified"] += 1
                 continue
             listing = opportunity.get("listing")
             product_key = opportunity.get("product_key")
